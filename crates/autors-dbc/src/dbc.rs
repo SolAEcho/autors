@@ -1,3 +1,5 @@
+// Modified by SolAEcho (2026-10): `//` comments are stripped before statement
+// joining, and `signal_groups` is keyed by `(message id, group name)`.
 //! Reading and writing of CAN DBC database files.
 //! The central type is `DBCFile`: it holds nodes (`BU_`), messages (`BO_`)
 //! with their signals (`SG_`), value tables (`VAL_TABLE_`), environment
@@ -1075,7 +1077,8 @@ pub struct DBCFile {
     pub value_tables: IndexMap<String, ValueTable>,
     pub environments: BTreeMap<String, EnvironmentType>,
     pub attribute_definitions: BTreeMap<String, AttribDefType>,
-    pub signal_groups: IndexMap<u32, SignalGroupType>,
+    /// Keyed by `(message id, group name)`; a message may own several groups.
+    pub signal_groups: IndexMap<(u32, String), SignalGroupType>,
     pub attributes: IndexMap<String, AttributeType>,
 }
 
@@ -1184,7 +1187,8 @@ impl DBCFile {
                 "VAL_" => parse_signal_values(&mut file, &message_locations, rest),
                 "SIG_GROUP_" => {
                     if let Some(group) = parse_signal_group(rest) {
-                        file.signal_groups.insert(group.id, group);
+                        file.signal_groups
+                            .insert((group.id, group.name.clone()), group);
                     }
                 }
                 "SIG_VALTYPE_" => parse_signal_float_type(&mut file, &message_locations, rest),
@@ -1503,6 +1507,25 @@ fn statement_has_unterminated_quote(statement: &str) -> bool {
     quoted
 }
 
+/// Removes a `//` comment outside quoted strings. `quoted` carries the quote
+/// state from earlier lines of the same statement; the end state is returned.
+fn strip_line_comment(line: &str, mut quoted: bool) -> (&str, bool) {
+    let mut escaped = false;
+    let mut characters = line.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' && quoted {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if !quoted && character == '/' && matches!(characters.peek(), Some((_, '/'))) {
+            return (line[..index].trim_end(), quoted);
+        }
+    }
+    (line, quoted)
+}
+
 fn needs_semicolon(keyword: &str) -> bool {
     matches!(
         keyword,
@@ -1525,7 +1548,7 @@ fn logical_lines(text: &str) -> Result<Vec<(u32, Cow<'_, str>)>> {
     let mut lines = text.lines().enumerate().peekable();
     let mut in_ns = false;
     while let Some((index, raw)) = lines.next() {
-        let statement = raw.trim();
+        let (statement, mut quoted) = strip_line_comment(raw.trim(), false);
         if statement.is_empty() {
             output.push((index as u32 + 1, Cow::Borrowed(statement)));
             continue;
@@ -1552,8 +1575,10 @@ fn logical_lines(text: &str) -> Result<Vec<(u32, Cow<'_, str>)>> {
                         message: format!("unterminated {keyword} statement"),
                     });
                 };
+                let (next, next_quoted) = strip_line_comment(next.trim(), quoted);
+                quoted = next_quoted;
                 statement.push('\n');
-                statement.push_str(next.trim());
+                statement.push_str(next);
             }
             output.push((index as u32 + 1, Cow::Owned(statement)));
         } else {
@@ -2045,7 +2070,10 @@ SIG_VALTYPE_ 100 Val : 2;
         assert_eq!(signal.len, 64);
         assert_eq!(signal.enums.as_ref().unwrap()[&1], "One");
         assert_eq!(file.environments["Env"].access, EnvAccessType::Write);
-        assert_eq!(file.signal_groups[&100].signal_refs, ["Val", "Mux"]);
+        assert_eq!(
+            file.signal_groups[&(100, "Group".to_string())].signal_refs,
+            ["Val", "Mux"]
+        );
     }
 
     #[test]
@@ -2059,6 +2087,50 @@ SIG_VALTYPE_ 100 Val : 2;
         assert_eq!(first.attribute_definitions, second.attribute_definitions);
         assert_eq!(first.signal_groups, second.signal_groups);
         assert_eq!(first.attributes, second.attributes);
+    }
+
+    #[test]
+    fn trailing_comments_do_not_swallow_the_next_statement() {
+        let file = DBCFile::parse_str(
+            "// header
+VERSION \"\"
+BU_: E
+BO_ 1 A: 8 E // message
+             BA_DEF_ BO_ \"First\" INT 0 9; // [ms]
+             BA_DEF_ BO_ \"Second\" INT 0 9;
+             CM_ BO_ 1 \"see http://x
+// still text\";
+",
+        )
+        .unwrap();
+        assert_eq!(
+            file.attribute_definitions.keys().collect::<Vec<_>>(),
+            ["First", "Second"]
+        );
+        assert_eq!(
+            file.get_message(1).unwrap().comment,
+            "see http://x
+// still text"
+        );
+    }
+
+    #[test]
+    fn a_message_keeps_several_signal_groups() {
+        let text = "BU_: E
+BO_ 1 A: 8 E
+ SG_ X : 0|8@1+ (1,0) [0|0] \"\" E
+ SG_ Y : 8|8@1+ (1,0) [0|0] \"\" E
+                    SIG_GROUP_ 1 G1 1 : X;
+SIG_GROUP_ 1 G2 1 : X Y;
+";
+        let first = DBCFile::parse_str(text).unwrap();
+        assert_eq!(first.signal_groups.len(), 2);
+        assert_eq!(
+            first.signal_groups[&(1, "G2".to_string())].signal_refs,
+            ["X", "Y"]
+        );
+        let second = DBCFile::parse_str(&first.write_string()).unwrap();
+        assert_eq!(first.signal_groups, second.signal_groups);
     }
 
     #[test]
