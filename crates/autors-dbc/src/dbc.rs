@@ -384,9 +384,10 @@ impl SignalFlagsType {
     pub const BIG_ENDIAN: Self = Self(1);
     /// Signed.
     pub const SIGNED: Self = Self(2);
-    /// Multiplexor (switch) signal.
+    /// Multiplexor (switch) signal (`M`, or the `M` suffix of `m<value>M`).
     pub const MULTIPLEX_SIGNAL: Self = Self(4);
-    /// Multiplexed signal.
+    /// Multiplexed signal (`m<value>`, or the `m<value>` prefix of `m<value>M`).
+    /// May be combined with [`Self::MULTIPLEX_SIGNAL`] for extended multiplexing.
     pub const MULTIPLEXED: Self = Self(8);
 
     /// Raw bit value.
@@ -636,7 +637,8 @@ pub struct SignalType {
     pub start: u16,
     /// Length in bits.
     pub len: u16,
-    /// Multiplex switch value (only meaningful when `is_multiplexed`).
+    /// Multiplex switch value of the `m<value>` / `m<value>M` indicator
+    /// (only meaningful when `is_multiplexed`).
     pub multiplex_value: u32,
     /// Conversion factor (raw * factor + offset = physical).
     pub factor: f64,
@@ -727,7 +729,9 @@ impl SignalType {
         self.flags.set(SignalFlagsType::SIGNED, signed);
     }
 
-    /// Returns whether this signal selects a multiplex branch.
+    /// Returns whether this signal selects a multiplex branch (`M` or `m<value>M`).
+    /// A signal that is also [`Self::is_multiplexed`] is an extended-multiplexing
+    /// sub-multiplexor, not the message's root multiplexor.
     pub fn is_multiplex_signal(&self) -> bool {
         self.flags.contains(SignalFlagsType::MULTIPLEX_SIGNAL)
     }
@@ -737,7 +741,7 @@ impl SignalType {
         self.flags.set(SignalFlagsType::MULTIPLEX_SIGNAL, on);
     }
 
-    /// Returns whether this signal belongs to a multiplex branch.
+    /// Returns whether this signal belongs to a multiplex branch (`m<value>` or `m<value>M`).
     pub fn is_multiplexed(&self) -> bool {
         self.flags.contains(SignalFlagsType::MULTIPLEXED)
     }
@@ -827,12 +831,11 @@ impl SignalType {
     }
 
     fn file_line(&self) -> String {
-        let mux = if self.is_multiplex_signal() {
-            " M".to_string()
-        } else if self.is_multiplexed() {
-            format!(" m{}", self.multiplex_value)
-        } else {
-            String::new()
+        let mux = match (self.is_multiplexed(), self.is_multiplex_signal()) {
+            (true, true) => format!(" m{}M", self.multiplex_value),
+            (true, false) => format!(" m{}", self.multiplex_value),
+            (false, true) => " M".to_string(),
+            (false, false) => String::new(),
         };
         let byte_order = if self.is_little_endian() { '1' } else { '0' };
         let sign = if self.is_signed() { '-' } else { '+' };
@@ -922,14 +925,17 @@ impl MsgType {
             .find(|signal| signal.name == signal_name)
     }
 
+    /// Returns the root multiplexor (`M`), which `add_signal` keeps first.
+    /// Extended-multiplexing sub-multiplexors (`m<value>M`) are not roots.
     pub fn get_multiplex_signal(&self) -> Option<&SignalType> {
         self.signals
             .first()
-            .filter(|signal| signal.is_multiplex_signal())
+            .filter(|signal| signal.is_multiplex_signal() && !signal.is_multiplexed())
     }
 
+    /// Appends a signal; a root multiplexor (`M`) is inserted first instead.
     pub fn add_signal(&mut self, signal: SignalType) {
-        if signal.is_multiplex_signal() {
+        if signal.is_multiplex_signal() && !signal.is_multiplexed() {
             self.signals.insert(0, signal);
         } else {
             self.signals.push(signal);
@@ -1150,8 +1156,12 @@ impl DBCFile {
                     }
                 }
                 "SG_" => {
+                    let signal = parse_signal(rest).map_err(|message| Error::Parse {
+                        line: line_no,
+                        message,
+                    })?;
                     if let (Some((source_name, message_index)), Some(signal)) =
-                        (current_message.as_ref(), parse_signal(rest))
+                        (current_message.as_ref(), signal)
                     {
                         if let Some(message) = file
                             .sources
@@ -1608,13 +1618,60 @@ fn parse_message(rest: &str) -> Option<MsgType> {
     })
 }
 
-fn parse_signal(rest: &str) -> Option<SignalType> {
-    let colon = rest.find(':')?;
-    let descriptor = rest[..colon].trim();
-    let mut descriptor_parts = descriptor.split_whitespace();
-    let name = descriptor_parts.next()?.to_string();
-    let multiplex = descriptor_parts.next();
-    let mut cursor = Cur::new(rest[colon + 1..].trim_start());
+/// Parses the `m<value>`, `M` or `m<value>M` multiplexer indicator into
+/// `(multiplexed_by, is_multiplexor)`. Returns `None` for anything else.
+fn parse_multiplex_indicator(token: &str) -> Option<(Option<u32>, bool)> {
+    if token == "M" {
+        return Some((None, true));
+    }
+    let value = token.strip_prefix('m')?;
+    let (digits, multiplexor) = match value.strip_suffix('M') {
+        Some(digits) => (digits, true),
+        None => (value, false),
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((Some(digits.parse().ok()?), multiplexor))
+}
+
+/// Parses an `SG_` statement. A malformed multiplexer indicator is an error
+/// rather than a silently changed multiplexing role; other layout errors yield
+/// `Ok(None)`.
+fn parse_signal(rest: &str) -> std::result::Result<Option<SignalType>, String> {
+    let Some(colon) = rest.find(':') else {
+        return Ok(None);
+    };
+    let mut descriptor_parts = rest[..colon].split_whitespace();
+    let Some(name) = descriptor_parts.next() else {
+        return Ok(None);
+    };
+    let multiplex = match descriptor_parts.next() {
+        Some(token) => parse_multiplex_indicator(token).ok_or_else(|| {
+            format!("invalid multiplexer indicator {token:?} for signal {name:?}")
+        })?,
+        None => (None, false),
+    };
+    if let Some(extra) = descriptor_parts.next() {
+        return Err(format!(
+            "unexpected token {extra:?} in descriptor of signal {name:?}"
+        ));
+    }
+    let Some(mut signal) = parse_signal_layout(&rest[colon + 1..]) else {
+        return Ok(None);
+    };
+    signal.name = name.to_string();
+    let (multiplexed_by, multiplexor) = multiplex;
+    if let Some(value) = multiplexed_by {
+        signal.multiplex_value = value;
+        signal.set_multiplexed(true);
+    }
+    signal.set_multiplex_signal(multiplexor);
+    Ok(Some(signal))
+}
+
+fn parse_signal_layout(layout: &str) -> Option<SignalType> {
+    let mut cursor = Cur::new(layout.trim_start());
     let start = cursor.digits().parse().ok()?;
     cursor.expect('|')?;
     let len = cursor.digits().parse().ok()?;
@@ -1646,7 +1703,6 @@ fn parse_signal(rest: &str) -> Option<SignalType> {
         .map(str::to_string)
         .collect();
     let mut signal = SignalType {
-        name,
         start,
         len,
         factor,
@@ -1659,14 +1715,6 @@ fn parse_signal(rest: &str) -> Option<SignalType> {
     };
     signal.set_little_endian(byte_order != '0');
     signal.set_signed(sign == '-');
-    if let Some(multiplex) = multiplex {
-        if multiplex == "M" {
-            signal.set_multiplex_signal(true);
-        } else if let Some(value) = multiplex.strip_prefix('m') {
-            signal.multiplex_value = value.parse().unwrap_or(0);
-            signal.set_multiplexed(true);
-        }
-    }
     Some(signal)
 }
 
@@ -2154,5 +2202,84 @@ SIG_GROUP_ 1 G2 1 : X Y;
         let issues = file.plausibility_check();
         assert_eq!(issues.len(), 2);
         assert_eq!(issues[0].message, "Minimum is greater than maximum");
+    }
+
+    const EXTENDED_MUX: &str = "BU_: E
+BO_ 1 A: 8 E
+ SG_ Sub m1M : 8|4@1+ (1,0) [0|15] \"\" E
+ SG_ Root M : 0|4@1+ (1,0) [0|15] \"\" E
+ SG_ Leaf m2 : 16|8@1+ (1,0) [0|255] \"\" E
+";
+
+    #[test]
+    fn parses_and_writes_extended_multiplexor_indicator() {
+        let first = DBCFile::parse_str(EXTENDED_MUX).unwrap();
+        let message = first.get_message(1).unwrap();
+        let names: Vec<_> = message.signals.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Root", "Sub", "Leaf"]);
+        assert_eq!(message.get_multiplex_signal().unwrap().name, "Root");
+        let sub = message.get_signal("Sub").unwrap();
+        assert!(sub.is_multiplexed());
+        assert!(sub.is_multiplex_signal());
+        assert_eq!(sub.multiplex_value, 1);
+        let root = message.get_signal("Root").unwrap();
+        assert!(root.is_multiplex_signal() && !root.is_multiplexed());
+
+        let text = first.write_string();
+        assert!(text.contains(" SG_ Sub m1M : 8|4@1+"), "{text}");
+        assert!(text.contains(" SG_ Root M : 0|4@1+"), "{text}");
+        assert!(text.contains(" SG_ Leaf m2 : 16|8@1+"), "{text}");
+        let second = DBCFile::parse_str(&text).unwrap();
+        assert_eq!(first.get_message(1), second.get_message(1));
+        assert_eq!(text, second.write_string());
+    }
+
+    #[test]
+    fn rejects_malformed_multiplexer_indicators() {
+        for indicator in [
+            "m",
+            "mX",
+            "Mx",
+            "m1X",
+            "mM",
+            "m+1",
+            "m-1",
+            "M1",
+            "m4294967296",
+            "m1 M",
+        ] {
+            let text = format!(
+                "BU_: E
+BO_ 1 A: 8 E
+ SG_ S {indicator} : 0|8@1+ (1,0) [0|1] \"\" E
+"
+            );
+            match DBCFile::parse_str(&text) {
+                Err(Error::Parse { line: 3, message }) => {
+                    assert!(message.contains("signal \"S\""), "{indicator}: {message}")
+                }
+                other => panic!("{indicator}: expected parse error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn extended_multiplexing_is_plausible() {
+        let file = DBCFile::parse_str(EXTENDED_MUX).unwrap();
+        assert!(file.plausibility_check().is_empty());
+
+        let orphan = DBCFile::parse_str(
+            "BU_: E
+BO_ 1 A: 8 E
+ SG_ Sub m1M : 8|4@1+ (1,0) [0|15] \"\" E
+",
+        )
+        .unwrap();
+        let issues = orphan.plausibility_check();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(
+            issues[0].message,
+            "Multiplexed signals present but no multiplexor signal"
+        );
     }
 }
