@@ -1285,6 +1285,14 @@ fn ensure_unique_names(names: &[String], kind: &str) -> Result<()> {
 }
 
 pub(crate) fn validate(ldf: &Ldf) -> Result<()> {
+    // The writer emits comments verbatim, so each must lex back to comments only.
+    for comment in &ldf.comments {
+        if !matches!(Lexer::new(comment).tokenize(), Ok((tokens, _)) if tokens.is_empty()) {
+            return Err(Error::Invalid(format!(
+                "comment {comment:?} is not delimited by // or /* */"
+            )));
+        }
+    }
     let node_exists = |name: &str| name == ldf.master.name || ldf.slaves.contains_key(name);
     for signal in ldf.signals.values() {
         let publisher = signal

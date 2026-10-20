@@ -191,3 +191,33 @@ Frames { Status: 1, Slave, 1 { Speed, 0; } }
     assert!(reparsed.writes_node_attributes());
     assert_eq!(reparsed.slaves["Slave"].p2_min.as_millis(), 75);
 }
+
+#[test]
+fn comments_must_keep_their_delimiters_to_be_written() {
+    let mut ldf = Ldf::parse_str(SAMPLE).unwrap();
+    ldf.comments = vec!["// line
+/* block
+spans */"
+        .to_string()];
+    let reparsed = Ldf::parse_str(&ldf.write_string().unwrap()).unwrap();
+    assert_eq!(
+        reparsed.comments,
+        [
+            "// line",
+            "/* block
+spans */"
+        ]
+    );
+
+    for invalid in [
+        "plain text",
+        "// ok
+plain",
+        "/* open",
+        "/* a */ b */",
+    ] {
+        ldf.comments = vec![invalid.to_string()];
+        assert!(ldf.validate().is_err(), "{invalid:?}");
+        assert!(ldf.write_string().is_err(), "{invalid:?}");
+    }
+}
