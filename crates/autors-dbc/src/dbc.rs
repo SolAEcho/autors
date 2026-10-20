@@ -1,11 +1,13 @@
 // Modified by SolAEcho (2026-10): `//` comments are stripped before statement
-// joining, and `signal_groups` is keyed by `(message id, group name)`.
+// joining, `signal_groups` is keyed by `(message id, group name)`, and message
+// transmitters (`BO_TX_BU_`) plus complete environment variables are modeled.
 //! Reading and writing of CAN DBC database files.
 //! The central type is `DBCFile`: it holds nodes (`BU_`), messages (`BO_`)
 //! with their signals (`SG_`), value tables (`VAL_TABLE_`), environment
-//! variables (`EV_`), attribute definitions (`BA_DEF_`) and their defaults
-//! (`BA_DEF_DEF_`), attribute values (`BA_`), signal groups (`SIG_GROUP_`),
-//! and comments (`CM_`).
+//! variables (`EV_`, `ENVVAR_DATA_`), message transmitters (`BO_TX_BU_`),
+//! attribute definitions (`BA_DEF_`) and their defaults (`BA_DEF_DEF_`),
+//! attribute values (`BA_`), value descriptions (`VAL_`), signal groups
+//! (`SIG_GROUP_`), and comments (`CM_`).
 //! Parsing is deliberately lenient: unrecognized or malformed lines are
 //! skipped, and errors are only reported where recovery is impossible
 //! (invalid numbers, unterminated multi-line statements). Writing aims to be
@@ -14,14 +16,11 @@
 //! - Node and environment variable attribute assignments (`BA_ ... BU_` /
 //!   `BA_ ... EV_`) attach by node / environment variable name, as the DBC
 //!   standard specifies.
-//! - Environment variable attributes and comments (`CM_ EV_`) are parsed
-//!   but never written.
 //! - Floating-point numbers are always written in an invariant,
 //!   locale-independent format.
-//! - `EnvAccessType::Read` uses the nonstandard value 8001 (the DBC
-//!   standard assigns 1) and is written as `DUMMY_NODE_VECTOR8001`; parsing
-//!   accepts only "0"/"2"/"3"/"8001" (anything else, including the standard
-//!   "1", maps to `Unrestricted`).
+//! - Environment variable access codes (`DUMMY_NODE_VECTOR<code>`) map 0..=3
+//!   to `EnvAccessType` variants; any other numeric code is preserved
+//!   verbatim, and an `EV_` line with a non-numeric code is skipped.
 
 use crate::error::{Error, Result};
 use indexmap::IndexMap;
@@ -287,45 +286,53 @@ impl fmt::Display for AttribDefValueType {
     }
 }
 
-/// Environment variable access type.
-/// `Read` uses the nonstandard value 8001 (the DBC standard assigns 1) and
-/// is written as `DUMMY_NODE_VECTOR8001`; the value is preserved verbatim so
-/// that files round-trip unchanged.
+/// Environment variable access type (`DUMMY_NODE_VECTOR<code>`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EnvAccessType {
     /// `DUMMY_NODE_VECTOR0`.
     #[default]
     Unrestricted,
+    /// `DUMMY_NODE_VECTOR1`.
+    Read,
     /// `DUMMY_NODE_VECTOR2`.
     Write,
     /// `DUMMY_NODE_VECTOR3`.
     ReadWrite,
-    /// `DUMMY_NODE_VECTOR8001` (nonstandard; see the module documentation).
-    Read,
+    /// Any other numeric code (e.g. `8000`..`8003`), preserved verbatim.
+    Other(u32),
 }
 
 impl EnvAccessType {
-    /// Numeric value (used when writing).
-    pub fn as_i32(self) -> i32 {
+    /// Numeric code written after `DUMMY_NODE_VECTOR`.
+    pub fn code(self) -> u32 {
         match self {
             Self::Unrestricted => 0,
+            Self::Read => 1,
             Self::Write => 2,
             Self::ReadWrite => 3,
-            Self::Read => 8001,
+            Self::Other(code) => code,
         }
     }
 
-    /// Parse from the access_type token: the `DUMMY_NODE_VECTOR` prefix is
-    /// stripped first. "0" → Unrestricted, "2" → Write, "3" → ReadWrite,
-    /// "8001" → Read, anything else → Unrestricted (so the standard value
-    /// "1" also maps to Unrestricted).
-    pub fn from_dbc_token(tok: &str) -> Self {
-        match tok.replace("DUMMY_NODE_VECTOR", "").as_str() {
-            "2" => Self::Write,
-            "3" => Self::ReadWrite,
-            "8001" => Self::Read,
-            _ => Self::Unrestricted,
+    /// Maps a numeric access code; codes 0..=3 select the named variants.
+    pub fn from_code(code: u32) -> Self {
+        match code {
+            0 => Self::Unrestricted,
+            1 => Self::Read,
+            2 => Self::Write,
+            3 => Self::ReadWrite,
+            other => Self::Other(other),
         }
+    }
+
+    /// Parses an access token with or without the `DUMMY_NODE_VECTOR`
+    /// prefix; returns `None` when the remaining code is not a decimal number.
+    pub fn from_dbc_token(tok: &str) -> Option<Self> {
+        let code = tok.strip_prefix("DUMMY_NODE_VECTOR").unwrap_or(tok);
+        if code.is_empty() || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        code.parse().ok().map(Self::from_code)
     }
 }
 
@@ -521,6 +528,8 @@ pub(crate) enum AttrTarget<'a> {
     Message(u32),
     /// Signal attribute (message ID + signal name).
     Signal(u32, &'a str),
+    /// Environment variable attribute (variable name).
+    Environment(&'a str),
 }
 
 /// Attribute value (`BA_`).
@@ -575,6 +584,9 @@ impl AttributeType {
             AttrTarget::Message(id) => format!("BA_ \"{}\" BO_ {} {};", self.attrib_def, id, text),
             AttrTarget::Signal(id, sig) => {
                 format!("BA_ \"{}\" SG_ {} {} {};", self.attrib_def, id, sig, text)
+            }
+            AttrTarget::Environment(name) => {
+                format!("BA_ \"{}\" EV_ {} {};", self.attrib_def, name, text)
             }
         }
     }
@@ -866,13 +878,7 @@ impl SignalType {
     }
 
     fn value_line(&self, msg_id: u32) -> Option<String> {
-        let values = self.enums.as_ref().filter(|values| !values.is_empty())?;
-        let mut line = format!("VAL_ {msg_id} {} ", self.name);
-        for (value, text) in values {
-            line.push_str(&format!("{value} \"{text}\" "));
-        }
-        line.push(';');
-        Some(line)
+        value_line(&format!("{msg_id} {}", self.name), self.enums.as_ref())
     }
 }
 
@@ -886,7 +892,12 @@ pub struct MsgType {
     pub id: u32,
     pub name: String,
     pub dlc: u8,
+    /// Transmitter written on the `BO_` line; the message is stored under
+    /// this node in `DBCFile::sources`.
     pub source: String,
+    /// `BO_TX_BU_` transmitter list in file order; empty when the message has
+    /// no such statement. It may repeat `source`.
+    pub transmitters: Vec<String>,
     pub comment: String,
     pub signals: Vec<SignalType>,
     pub attributes: IndexMap<String, AttributeType>,
@@ -952,6 +963,11 @@ impl MsgType {
     fn comment_line(&self) -> Option<String> {
         (!self.comment.is_empty()).then(|| format!("CM_ BO_ {} \"{}\";", self.id, self.comment))
     }
+
+    fn transmitters_line(&self) -> Option<String> {
+        (!self.transmitters.is_empty())
+            .then(|| format!("BO_TX_BU_ {} : {};", self.id, self.transmitters.join(",")))
+    }
 }
 
 /// Network node (`BU_`) and the messages it transmits.
@@ -988,7 +1004,11 @@ pub struct EnvironmentType {
     pub index: i32,
     pub access: EnvAccessType,
     pub receivers: Vec<String>,
+    /// `ENVVAR_DATA_` size in bytes; `Some` marks a data environment variable.
+    pub data_size: Option<u32>,
     pub comment: String,
+    /// `VAL_ <name> ...` value descriptions, in file order.
+    pub enums: Option<IndexMap<i64, String>>,
     pub attributes: IndexMap<String, AttributeType>,
 }
 
@@ -1011,7 +1031,7 @@ impl EnvironmentType {
             self.unit,
             fmt_num(self.start_value),
             self.index,
-            self.access.as_i32()
+            self.access.code()
         );
         if !self.receivers.is_empty() {
             line.push(' ');
@@ -1020,6 +1040,30 @@ impl EnvironmentType {
         line.push(';');
         line
     }
+
+    fn data_line(&self) -> Option<String> {
+        self.data_size
+            .map(|size| format!("ENVVAR_DATA_ {}: {size};", self.name))
+    }
+
+    fn comment_line(&self) -> Option<String> {
+        (!self.comment.is_empty()).then(|| format!("CM_ EV_ {} \"{}\";", self.name, self.comment))
+    }
+
+    fn value_line(&self) -> Option<String> {
+        value_line(&self.name, self.enums.as_ref())
+    }
+}
+
+/// `VAL_ <target> <value> "<text>" ... ;` line; `None` without descriptions.
+fn value_line(target: &str, values: Option<&IndexMap<i64, String>>) -> Option<String> {
+    let values = values.filter(|values| !values.is_empty())?;
+    let mut line = format!("VAL_ {target} ");
+    for (value, text) in values {
+        line.push_str(&format!("{value} \"{text}\" "));
+    }
+    line.push(';');
+    Some(line)
 }
 
 /// Signal group (`SIG_GROUP_`).
@@ -1202,6 +1246,8 @@ impl DBCFile {
                     }
                 }
                 "SIG_VALTYPE_" => parse_signal_float_type(&mut file, &message_locations, rest),
+                "BO_TX_BU_" => parse_message_transmitters(&mut file, &message_locations, rest),
+                "ENVVAR_DATA_" => parse_environment_data(&mut file, rest),
                 _ => {}
             }
 
@@ -1262,8 +1308,20 @@ impl DBCFile {
         }
 
         push_line(&mut output, "");
+        for message in self.messages() {
+            if let Some(line) = message.transmitters_line() {
+                push_line(&mut output, &line);
+            }
+        }
+        push_line(&mut output, "");
         for environment in self.environments.values() {
             push_line(&mut output, &environment.file_line());
+        }
+        push_line(&mut output, "");
+        for environment in self.environments.values() {
+            if let Some(line) = environment.data_line() {
+                push_line(&mut output, &line);
+            }
         }
         push_line(&mut output, "");
 
@@ -1283,6 +1341,11 @@ impl DBCFile {
                         push_line(&mut output, &line);
                     }
                 }
+            }
+        }
+        for environment in self.environments.values() {
+            if let Some(line) = environment.comment_line() {
+                push_line(&mut output, &line);
             }
         }
         push_line(&mut output, "");
@@ -1345,6 +1408,18 @@ impl DBCFile {
                 }
             }
         }
+        for environment in self.environments.values() {
+            for attribute in environment.attributes.values() {
+                let data_type = self
+                    .attribute_definitions
+                    .get(&attribute.attrib_def)
+                    .map(|definition| definition.data_type);
+                push_line(
+                    &mut output,
+                    &attribute.file_line(data_type, AttrTarget::Environment(&environment.name)),
+                );
+            }
+        }
 
         for source in self.sources.values() {
             for message in &source.messages {
@@ -1353,6 +1428,11 @@ impl DBCFile {
                         push_line(&mut output, &line);
                     }
                 }
+            }
+        }
+        for environment in self.environments.values() {
+            if let Some(line) = environment.value_line() {
+                push_line(&mut output, &line);
             }
         }
         for source in self.sources.values() {
@@ -1550,6 +1630,8 @@ fn needs_semicolon(keyword: &str) -> bool {
             | "VAL_TABLE_"
             | "SIG_GROUP_"
             | "SIG_VALTYPE_"
+            | "BO_TX_BU_"
+            | "ENVVAR_DATA_"
     )
 }
 
@@ -1736,7 +1818,7 @@ fn parse_environment(rest: &str) -> Option<EnvironmentType> {
     cursor.skip_ws();
     let index = cursor.num_token().parse().unwrap_or(0);
     cursor.skip_ws();
-    let access = EnvAccessType::from_dbc_token(cursor.token());
+    let access = EnvAccessType::from_dbc_token(cursor.token().trim_end_matches(';'))?;
     cursor.skip_ws();
     let receivers = cursor
         .rest()
@@ -1997,7 +2079,18 @@ fn parse_signal_values(
     rest: &str,
 ) {
     let mut cursor = Cur::new(rest);
-    let Some(id) = cursor.digits().parse().ok() else {
+    let digits = cursor.digits();
+    if digits.is_empty() {
+        // Identifiers cannot start with a digit, so a name targets an environment variable.
+        let name = cursor.token().to_string();
+        cursor.skip_ws();
+        let values = quoted_pairs(cursor.rest());
+        if let Some(environment) = file.environments.get_mut(&name) {
+            environment.enums = Some(values);
+        }
+        return;
+    }
+    let Ok(id) = digits.parse() else {
         return;
     };
     cursor.skip_ws();
@@ -2006,6 +2099,44 @@ fn parse_signal_values(
     let values = quoted_pairs(cursor.rest());
     if let Some(signal) = find_signal_mut(file, message_locations, id, &name) {
         signal.enums = Some(values);
+    }
+}
+
+fn parse_message_transmitters(
+    file: &mut DBCFile,
+    message_locations: &HashMap<u32, (String, usize)>,
+    rest: &str,
+) {
+    let mut cursor = Cur::new(rest);
+    let Some(id) = cursor.digits().parse().ok() else {
+        return;
+    };
+    cursor.skip_ws();
+    if cursor.expect(':').is_none() {
+        return;
+    }
+    let transmitters = cursor
+        .rest()
+        .trim()
+        .trim_end_matches(';')
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    if let Some(message) = find_message_mut(file, message_locations, id) {
+        message.transmitters = transmitters;
+    }
+}
+
+fn parse_environment_data(file: &mut DBCFile, rest: &str) {
+    let Some((name, size)) = rest.split_once(':') else {
+        return;
+    };
+    let Ok(size) = size.trim().trim_end_matches(';').trim().parse() else {
+        return;
+    };
+    if let Some(environment) = file.environments.get_mut(name.trim()) {
+        environment.data_size = Some(size);
     }
 }
 
@@ -2091,14 +2222,21 @@ VAL_TABLE_ State 0 "Off" 1 "On";
 BO_ 100 MsgA: 8 ECU1
  SG_ Mux M : 0|4@1+ (1,0) [0|15] "" ECU2
  SG_ Val m2 : 8|16@0- (0.5,-1) [-1|100] "V" ECU2,ECU1
+BO_TX_BU_ 100 : ECU1,ECU2;
 EV_ Env: 1 [0|10] "u" 2.5 7 DUMMY_NODE_VECTOR2 ECU1;
+EV_ Blob: 0 [0|0] "" 0 8 DUMMY_NODE_VECTOR8001 ECU2;
+ENVVAR_DATA_ Blob: 16;
 CM_ "network";
 CM_ BU_ ECU1 "node";
 CM_ BO_ 100 "message";
 CM_ SG_ 100 Val "signal";
+CM_ EV_ Env "environment";
 BA_DEF_ SG_ "SigAttr" ENUM "A","B";
+BA_DEF_ EV_ "EnvAttr" INT 0 10;
 BA_ "SigAttr" SG_ 100 Val 1;
+BA_ "EnvAttr" EV_ Env 4;
 VAL_ 100 Val 0 "Zero" 1 "One";
+VAL_ Env 0 "Off" 1 "On";
 SIG_GROUP_ 100 Group 1 : Val Mux;
 SIG_VALTYPE_ 100 Val : 2;
 "#;
@@ -2117,7 +2255,17 @@ SIG_VALTYPE_ 100 Val : 2;
         assert_eq!(signal.float_type, SignalFloatType::IeeeFloat64);
         assert_eq!(signal.len, 64);
         assert_eq!(signal.enums.as_ref().unwrap()[&1], "One");
-        assert_eq!(file.environments["Env"].access, EnvAccessType::Write);
+        assert_eq!(message.source, "ECU1");
+        assert_eq!(message.transmitters, ["ECU1", "ECU2"]);
+        let environment = &file.environments["Env"];
+        assert_eq!(environment.access, EnvAccessType::Write);
+        assert_eq!(environment.comment, "environment");
+        assert_eq!(environment.attributes["EnvAttr"].value, "4");
+        assert_eq!(environment.enums.as_ref().unwrap()[&1], "On");
+        assert_eq!(environment.data_size, None);
+        let blob = &file.environments["Blob"];
+        assert_eq!(blob.access, EnvAccessType::Other(8001));
+        assert_eq!(blob.data_size, Some(16));
         assert_eq!(
             file.signal_groups[&(100, "Group".to_string())].signal_refs,
             ["Val", "Mux"]
@@ -2135,6 +2283,54 @@ SIG_VALTYPE_ 100 Val : 2;
         assert_eq!(first.attribute_definitions, second.attribute_definitions);
         assert_eq!(first.signal_groups, second.signal_groups);
         assert_eq!(first.attributes, second.attributes);
+        let environment = &second.environments["Env"];
+        assert_eq!(
+            environment.enums.as_ref().unwrap().as_slice(),
+            first.environments["Env"].enums.as_ref().unwrap().as_slice()
+        );
+    }
+
+    #[test]
+    fn writes_transmitters_and_complete_environment_variables() {
+        let text = DBCFile::parse_str(SAMPLE).unwrap().write_string();
+        for line in [
+            "BO_TX_BU_ 100 : ECU1,ECU2;",
+            "EV_ Blob: 0 [0|0] \"\" 0 8 DUMMY_NODE_VECTOR8001 ECU2;",
+            "ENVVAR_DATA_ Blob: 16;",
+            "CM_ EV_ Env \"environment\";",
+            "BA_ \"EnvAttr\" EV_ Env 4;",
+            "VAL_ Env 0 \"Off\" 1 \"On\" ;",
+        ] {
+            assert!(text.contains(line), "missing {line}");
+        }
+    }
+
+    #[test]
+    fn environment_access_codes_round_trip_and_non_numeric_codes_skip_the_variable() {
+        for (code, access) in [
+            ("0", EnvAccessType::Unrestricted),
+            ("1", EnvAccessType::Read),
+            ("2", EnvAccessType::Write),
+            ("3", EnvAccessType::ReadWrite),
+            ("8003", EnvAccessType::Other(8003)),
+        ] {
+            let text = format!("EV_ E: 0 [0|1] \"\" 0 1 DUMMY_NODE_VECTOR{code} Vector__XXX;\n");
+            let file = DBCFile::parse_str(&text).unwrap();
+            assert_eq!(file.environments["E"].access, access);
+            assert!(file
+                .write_string()
+                .contains(&format!("DUMMY_NODE_VECTOR{code} Vector__XXX;")));
+        }
+        let file = DBCFile::parse_str("EV_ E: 0 [0|1] \"\" 0 1 DUMMY_NODE_VECTORX Vector__XXX;\n")
+            .unwrap();
+        assert!(file.environments.is_empty());
+    }
+
+    #[test]
+    fn transmitters_of_unknown_messages_are_ignored() {
+        let file = DBCFile::parse_str("BU_: A B\nBO_ 1 M: 8 A\nBO_TX_BU_ 2 : A,B;\n").unwrap();
+        assert!(file.get_message(1).unwrap().transmitters.is_empty());
+        assert!(!file.write_string().contains("BO_TX_BU_ 2"));
     }
 
     #[test]

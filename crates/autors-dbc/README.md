@@ -6,7 +6,8 @@ extraction.
 ## Highlights
 
 - `DBCFile` reads DBC text or files and writes the resulting database back.
-- Models messages, signals, nodes, environment variables, value tables,
+- Models messages (including `BO_TX_BU_` transmitters), signals, nodes,
+  environment variables (with `ENVVAR_DATA_` and value descriptions), value tables,
   comments, attributes, attribute definitions, and signal groups.
 - Stable insertion ordering supports predictable round trips.
 - `SignalType` handles Intel/Motorola bit placement, signed values,
