@@ -1,6 +1,9 @@
 // Modified by SolAEcho (2026-10): `//` comments are stripped before statement
 // joining, `signal_groups` is keyed by `(message id, group name)`, and message
-// transmitters (`BO_TX_BU_`) plus complete environment variables are modeled.
+// transmitters (`BO_TX_BU_`) plus complete environment variables are modeled;
+// `statements` exposes the logical statements the parser dispatches on, line
+// breaks outside quoted strings join as spaces, and the `NS_` symbol list ends
+// only at a `BS_` or `BU_` keyword.
 //! Reading and writing of CAN DBC database files.
 //! The central type is `DBCFile`: it holds nodes (`BU_`), messages (`BO_`)
 //! with their signals (`SG_`), value tables (`VAL_TABLE_`), environment
@@ -1150,35 +1153,26 @@ impl DBCFile {
         let mut file = Self::new();
         let mut current_message: Option<(String, usize)> = None;
         let mut message_locations = HashMap::new();
-        let mut in_ns = false;
 
-        for (line_no, statement) in statements {
-            let line = statement.trim();
-            if line.is_empty() {
+        for LogicalLine {
+            line: line_no,
+            text: statement,
+            ns_symbol,
+        } in statements
+        {
+            let line = statement.as_ref();
+            if ns_symbol {
+                file.ns.push(trim_kws(line).to_string());
                 continue;
-            }
-            if in_ns {
-                if line.starts_with("BS_") {
-                    in_ns = false;
-                    continue;
-                }
-                if line.starts_with("BU_") {
-                    in_ns = false;
-                } else {
-                    file.ns.push(trim_kws(line).to_string());
-                    continue;
-                }
             }
             let (keyword, rest) = split_keyword(line);
             match keyword {
                 "VERSION" => file.version = trim_qs(rest.trim()).to_string(),
                 "NS_" => {
-                    in_ns = true;
                     if !trim_kws(rest).is_empty() {
                         file.ns.push("NS_".to_string());
                     }
                 }
-                "BS_" => in_ns = false,
                 "BU_" => {
                     for name in trim_kws(rest).split_whitespace() {
                         file.sources.insert(name.to_string(), SourceType::new(name));
@@ -1635,47 +1629,101 @@ fn needs_semicolon(keyword: &str) -> bool {
     )
 }
 
-fn logical_lines(text: &str) -> Result<Vec<(u32, Cow<'_, str>)>> {
+/// One top-level DBC statement as [`DBCFile::parse_str`] dispatches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Statement<'a> {
+    /// 1-based line on which the statement starts.
+    pub line: u32,
+    /// Trimmed statement text with `//` comments removed. Continuation lines
+    /// of a `;`-terminated statement are joined with a space, or with `\n`
+    /// inside a quoted string.
+    pub text: Cow<'a, str>,
+}
+
+impl Statement<'_> {
+    /// Leading keyword without a trailing `:`, for example `BO_` or `VAL_`.
+    pub fn keyword(&self) -> &str {
+        split_keyword(&self.text).0
+    }
+
+    /// Text after the keyword, with surrounding spaces, tabs and colons trimmed.
+    pub fn body(&self) -> &str {
+        split_keyword(&self.text).1
+    }
+}
+
+/// Splits DBC text into the non-empty statements [`DBCFile::parse_str`]
+/// reads, in source order. Entries of the `NS_` symbol list are omitted.
+/// Statements whose keyword the parser does not model are included, so
+/// callers can detect content that parsing skips.
+///
+/// Fails exactly when `parse_str` fails on an unterminated multi-line
+/// statement.
+pub fn statements(text: &str) -> Result<Vec<Statement<'_>>> {
+    Ok(logical_lines(text)?
+        .into_iter()
+        .filter(|line| !line.ns_symbol)
+        .map(|line| Statement {
+            line: line.line,
+            text: line.text,
+        })
+        .collect())
+}
+
+struct LogicalLine<'a> {
+    line: u32,
+    text: Cow<'a, str>,
+    /// Entry of the `NS_` symbol list, which ends at a `BS_` or `BU_` keyword.
+    ns_symbol: bool,
+}
+
+fn logical_lines(text: &str) -> Result<Vec<LogicalLine<'_>>> {
     let mut output = Vec::new();
-    let mut lines = text.lines().enumerate().peekable();
+    let mut lines = text.lines().enumerate();
     let mut in_ns = false;
     while let Some((index, raw)) = lines.next() {
+        let line = index as u32 + 1;
         let (statement, mut quoted) = strip_line_comment(raw.trim(), false);
         if statement.is_empty() {
-            output.push((index as u32 + 1, Cow::Borrowed(statement)));
-            continue;
-        }
-        if statement.starts_with("NS_") {
-            in_ns = true;
-            output.push((index as u32 + 1, Cow::Borrowed(statement)));
-            continue;
-        }
-        if in_ns {
-            if statement.starts_with("BS_") {
-                in_ns = false;
-            }
-            output.push((index as u32 + 1, Cow::Borrowed(statement)));
             continue;
         }
         let keyword = split_keyword(statement).0;
-        if needs_semicolon(keyword) && !statement.trim_end().ends_with(';') {
+        if keyword == "NS_" {
+            in_ns = true;
+        } else if in_ns && !matches!(keyword, "BS_" | "BU_") {
+            output.push(LogicalLine {
+                line,
+                text: Cow::Borrowed(statement),
+                ns_symbol: true,
+            });
+            continue;
+        } else {
+            in_ns = false;
+        }
+        let text = if needs_semicolon(keyword) && !statement.ends_with(';') {
             let mut statement = statement.to_string();
             while !statement.trim_end().ends_with(';') {
                 let Some((_, next)) = lines.next() else {
                     return Err(Error::Parse {
-                        line: index as u32 + 1,
+                        line,
                         message: format!("unterminated {keyword} statement"),
                     });
                 };
+                // A line break is plain whitespace unless it continues a quoted string.
+                statement.push(if quoted { '\n' } else { ' ' });
                 let (next, next_quoted) = strip_line_comment(next.trim(), quoted);
                 quoted = next_quoted;
-                statement.push('\n');
                 statement.push_str(next);
             }
-            output.push((index as u32 + 1, Cow::Owned(statement)));
+            Cow::Owned(statement)
         } else {
-            output.push((index as u32 + 1, Cow::Borrowed(statement)));
-        }
+            Cow::Borrowed(statement)
+        };
+        output.push(LogicalLine {
+            line,
+            text,
+            ns_symbol: false,
+        });
     }
     Ok(output)
 }
@@ -2356,6 +2404,67 @@ BO_ 1 A: 8 E // message
             "see http://x
 // still text"
         );
+    }
+
+    #[test]
+    fn statements_join_multi_line_declarations_and_drop_comments() {
+        let text = "VERSION \"\" // version
+NS_ :
+ CM_
+ BU_SG_REL_
+ SG_MUL_VAL_
+BS_:
+BU_: E
+BO_ 1 A: 8 E
+ SG_ S : 0|8@1+ (1,0) [0|0] \"\" E
+BA_DEF_ BO_ \"Cycle\"
+  INT 0 // lower bound
+  100;
+EV_ Env: 0 [0|1] \"\" 0 1
+  DUMMY_NODE_VECTOR0 E;
+VAL_ 1 S 0 \"a // not a comment\"
+  1 \"b\";
+SG_MUL_VAL_ 1 S S 0-0;
+";
+        let statements = statements(text).unwrap();
+        assert_eq!(
+            statements
+                .iter()
+                .map(|statement| (statement.line, statement.keyword()))
+                .collect::<Vec<_>>(),
+            [
+                (1, "VERSION"),
+                (2, "NS_"),
+                (6, "BS_"),
+                (7, "BU_"),
+                (8, "BO_"),
+                (9, "SG_"),
+                (10, "BA_DEF_"),
+                (13, "EV_"),
+                (15, "VAL_"),
+                (17, "SG_MUL_VAL_"),
+            ]
+        );
+        assert_eq!(statements[6].text, "BA_DEF_ BO_ \"Cycle\" INT 0 100;");
+        assert_eq!(
+            statements[8].body(),
+            "1 S 0 \"a // not a comment\" 1 \"b\";"
+        );
+
+        let file = DBCFile::parse_str(text).unwrap();
+        assert_eq!(file.ns, ["CM_", "BU_SG_REL_", "SG_MUL_VAL_"]);
+        assert!(file.attribute_definitions.contains_key("Cycle"));
+        assert!(file.environments.contains_key("Env"));
+        let signal = &file.get_message(1).unwrap().signals[0];
+        assert_eq!(
+            signal.enums.as_ref().unwrap().values().collect::<Vec<_>>(),
+            ["a // not a comment", "b"]
+        );
+    }
+
+    #[test]
+    fn statements_reject_unterminated_multi_line_declarations() {
+        assert!(statements("VAL_ 1 S 0 \"a\"\n").is_err());
     }
 
     #[test]

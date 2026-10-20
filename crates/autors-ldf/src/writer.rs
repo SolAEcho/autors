@@ -251,7 +251,7 @@ fn write_placements(output: &mut String, placements: &[SignalPlacement], indent:
 }
 
 fn write_node_attributes(output: &mut String, ldf: &Ldf) {
-    if !ldf.has_node_attributes && ldf.language_version < LinVersion::LIN_2_0 {
+    if !ldf.writes_node_attributes() {
         return;
     }
     output.push_str("Node_attributes {\n");

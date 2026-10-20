@@ -1,3 +1,5 @@
+// Modified by SolAEcho (2026-10): `Ldf::writes_node_attributes` exposes whether
+// the writer emits the `Node_attributes` section.
 //! Editable LIN Description File model.
 
 use crate::error::{Error, Result};
@@ -569,6 +571,15 @@ impl Ldf {
     pub fn write(&self, path: impl AsRef<Path>) -> Result<()> {
         std::fs::write(path, self.write_string()?)?;
         Ok(())
+    }
+
+    /// Returns whether [`Ldf::write_string`] emits a `Node_attributes` section,
+    /// and with it each slave's protocol, NAD, product ID, response error,
+    /// fault-state signals, P2_min, ST_min, timeouts and configurable frames.
+    /// Always true for LIN 2.0 and newer; for older language versions only
+    /// when the parsed document declared `Node_attributes`.
+    pub fn writes_node_attributes(&self) -> bool {
+        self.has_node_attributes || self.language_version >= LinVersion::LIN_2_0
     }
 
     /// Validates cross-references, frame identifiers, and signal layouts.

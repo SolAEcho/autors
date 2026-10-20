@@ -164,3 +164,30 @@ fn rejects_cross_reference_and_layout_errors() {
     let overlap = SAMPLE.replace("Error, 8;", "Error, 7;");
     assert!(Ldf::parse_str(&overlap).is_err());
 }
+
+#[test]
+fn node_attributes_are_written_from_lin_2_0_or_when_declared() {
+    assert!(Ldf::parse_str(SAMPLE).unwrap().writes_node_attributes());
+
+    let lin13 = r#"
+LIN_description_file;
+LIN_protocol_version = "1.3";
+LIN_language_version = "1.3";
+LIN_speed = 19.2 kbps;
+Nodes { Master: Master, 5 ms, 0.1 ms; Slaves: Slave; }
+Signals { Speed: 8, 0, Slave, Master; }
+Frames { Status: 1, Slave, 1 { Speed, 0; } }
+"#;
+    let plain = Ldf::parse_str(lin13).unwrap();
+    assert!(!plain.writes_node_attributes());
+    assert!(!plain.write_string().unwrap().contains("Node_attributes"));
+
+    let declared = Ldf::parse_str(&format!(
+        "{lin13}Node_attributes {{ Slave {{ LIN_protocol = \"1.3\"; P2_min = 75 ms; }} }}\n"
+    ))
+    .unwrap();
+    assert!(declared.writes_node_attributes());
+    let reparsed = Ldf::parse_str(&declared.write_string().unwrap()).unwrap();
+    assert!(reparsed.writes_node_attributes());
+    assert_eq!(reparsed.slaves["Slave"].p2_min.as_millis(), 75);
+}
